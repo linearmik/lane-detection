@@ -13,6 +13,7 @@
 #include <opencv2/videoio.hpp>
 #include <string>
 #include <vector>
+#include <iostream>
 
 using namespace std;
 using namespace cv;
@@ -40,9 +41,9 @@ struct RoiParams {
     double topY = 0.60;
     double bottomY = 0.90;
     double topLeftX = 0.42;
-    double topRightX = 0.58;
-    double bottomLeftX = 0.03;
-    double bottomRightX = 0.97;
+    double topRightX = 0.50;
+    double bottomLeftX = 0.1;
+    double bottomRightX = 0.80;
 };
 
 inline bool operator==(const RoiParams& a, const RoiParams& b) {
@@ -63,11 +64,11 @@ struct PipelineConfig {
 //   city    : clip4, videoplayback (보닛 ~75%, 소실점 y ~0.45)
 bool applyRoiPreset(const string& name, PipelineConfig& cfg) {
     if (name == "highway") {
-        cfg.roi = {0.60, 0.90, 0.42, 0.58, 0.03, 0.97};
+        cfg.roi = {0.60, 0.90, 0.41, 0.50, 0.12, 0.80};
         return true;
     }
     if (name == "city") {
-        cfg.roi = {0.52, 0.75, 0.36, 0.64, 0.00, 1.00};
+        cfg.roi = {0.54, 0.75, 0.31, 0.57, 0.17, 0.75};
         return true;
     }
     return false;
@@ -235,7 +236,267 @@ private:
     RoiMasker masker_;
     PreprocessResult result_;
 };
+// 6. 허프 변환: ROI 엣지 영상에서 직선 선분 검출
+vector<Vec4i> detectLines(const Mat& roiEdges) {
+    vector<Vec4i> lines;
 
+    HoughLinesP(
+        roiEdges,
+        lines,
+        1,              // rho
+        CV_PI / 180,    // theta: 1도
+        30,             // threshold
+        30,             // minLineLength
+        20              // maxLineGap
+    );
+
+    return lines;
+}
+
+// 허프 변환으로 검출한 선분을 영상에 표시
+void drawLines(Mat& frame, const vector<Vec4i>& lines) {
+    for (const Vec4i& l : lines) {
+        cv::line(
+            frame,
+            Point(l[0], l[1]),
+            Point(l[2], l[3]),
+            Scalar(0, 0, 255),  // 빨간색
+            3                  // 선 두께
+        );
+    }
+}
+
+// 차선 중앙과 영상 중앙의 위치 정보
+struct LanePosition {
+    bool valid = false;
+    double laneCenterX = 0.0;
+    double roiCenterX = 0.0;
+    double offsetPx = 0.0;
+    double offsetRatio = 0.0;
+};
+// 차선 변경 감지 상태
+struct LaneChangeDetector {
+    bool armed = false;       // 차선 변경 감지 준비 상태
+    int centerFrames = 0;     // 중앙에 머문 프레임 수
+    int deviationFrames = 0;  // 중앙에서 벗어난 프레임 수
+    int alertFrames = 0;      // 알림을 유지할 프레임 수
+};
+
+// 좌우 대표 차선과 차선 중앙을 계산하고 표시
+LanePosition drawRepresentativeLaneLines(
+    Mat& frame,
+    const vector<Vec4i>& lines,
+    const vector<Point>& roiPolygon
+) {
+    // ROI 좌표 확인
+    if (roiPolygon.size() < 2) {
+        return {};
+    }
+
+    const int topY = roiPolygon[1].y;
+    const int bottomY = roiPolygon[0].y;
+    const double centerX = frame.cols / 2.0;
+
+    double leftSlopeSum = 0.0, leftInterceptSum = 0.0;
+    double rightSlopeSum = 0.0, rightInterceptSum = 0.0;
+
+    double leftWeight = 0.0, rightWeight = 0.0;
+
+    // 1. 허프 변환 결과를 좌우 차선으로 분류
+    for (const Vec4i& l : lines) {
+        double x1 = l[0], y1 = l[1];
+        double x2 = l[2], y2 = l[3];
+
+        if (abs(x2 - x1) < 1) continue;
+
+        double slope = (y2 - y1) / (x2 - x1);
+
+        if (abs(slope) < 0.3 || abs(slope) > 3.0) continue;
+
+        double midpointX = (x1 + x2) / 2.0;
+        double length = norm(Point(x2 - x1, y2 - y1));
+        double intercept = y1 - slope * x1;
+
+        if (slope < 0 && midpointX < centerX) {
+            leftSlopeSum += slope * length;
+            leftInterceptSum += intercept * length;
+            leftWeight += length;
+        }
+        else if (slope > 0 && midpointX > centerX) {
+            rightSlopeSum += slope * length;
+            rightInterceptSum += intercept * length;
+            rightWeight += length;
+        }
+    }
+
+    // 2. 양쪽 차선이 모두 검출된 경우에만 중앙 계산
+    if (leftWeight == 0 || rightWeight == 0) {
+        return {};
+    }
+
+    double leftSlope = leftSlopeSum / leftWeight;
+    double leftIntercept = leftInterceptSum / leftWeight;
+
+    double rightSlope = rightSlopeSum / rightWeight;
+    double rightIntercept = rightInterceptSum / rightWeight;
+
+    // 특정 y 좌표에서 각 차선의 x 좌표 계산
+    auto getX = [](double slope, double intercept, int y) {
+        return cvRound((y - intercept) / slope);
+        };
+
+    int leftTop = getX(leftSlope, leftIntercept, topY);
+    int leftBottom = getX(leftSlope, leftIntercept, bottomY);
+
+    int rightTop = getX(rightSlope, rightIntercept, topY);
+    int rightBottom = getX(rightSlope, rightIntercept, bottomY);
+
+    // 3. 좌우 차선 사이 영역을 초록색으로 채우기
+    vector<Point> laneArea = {
+        Point(leftTop, topY),
+        Point(rightTop, topY),
+        Point(rightBottom, bottomY),
+        Point(leftBottom, bottomY)
+    };
+
+    // 반투명 영역을 위한 별도 이미지
+    Mat overlay = frame.clone();
+
+    // 초록색 영역 채우기
+    fillConvexPoly(
+        overlay,
+        laneArea,
+        Scalar(0, 255, 0),
+        LINE_AA
+    );
+
+    // 원본 영상과 합성
+    addWeighted(overlay, 0.25, frame, 0.75, 0, frame);
+
+    // 4. 좌우 대표 차선 표시
+    // 초록색 영역을 먼저 표시하고 차선을 나중에 그려 선명하게 유지
+    cv::line(frame,
+        Point(leftTop, topY),
+        Point(leftBottom, bottomY),
+        Scalar(0, 0, 255), 5, LINE_AA);
+
+    cv::line(frame,
+        Point(rightTop, topY),
+        Point(rightBottom, bottomY),
+        Scalar(255, 0, 0), 5, LINE_AA);
+
+    // 5. 차선 중앙과 ROI 중앙 좌표 계산
+    LanePosition position;
+    // ROI 하단 기준으로 차선 중앙 계산
+    position.laneCenterX = (leftBottom + rightBottom) / 2.0;
+
+    // ROI 하단의 좌우 경계 사이 중앙 계산
+    position.roiCenterX =
+        (roiPolygon[0].x + roiPolygon[3].x) / 2.0;
+
+    // ROI 너비 계산
+    double roiWidth = abs(roiPolygon[3].x - roiPolygon[0].x);
+
+    if (roiWidth < 1) {
+        return {};
+    }
+
+    // 두 중심 사이의 거리
+    position.offsetPx =
+        position.laneCenterX - position.roiCenterX;
+
+    // ROI 너비 대비 오프셋 비율
+    position.offsetRatio =
+        position.offsetPx / roiWidth;
+
+    position.valid = true;
+
+    // 6. 차선 중앙과 영상 중앙 표시
+    // 흰색 점: 차선 중앙
+    circle(
+        frame,
+        Point(cvRound(position.laneCenterX), bottomY),
+        7,
+        Scalar(255, 255, 255),
+        FILLED,
+        LINE_AA
+    );
+
+    // 노란색 점: 영상 중앙
+    circle(
+        frame,
+        Point(cvRound(position.roiCenterX), bottomY),
+        7,
+        Scalar(0, 255, 255),
+        FILLED,
+        LINE_AA
+    );
+
+    return position;
+}
+// 차선 중심의 이동을 이용한 차선 변경 감지
+bool updateLaneChangeDetector(
+    const LanePosition& position,
+    LaneChangeDetector& detector
+) {
+    // 알림 유지 시간 감소
+    if (detector.alertFrames > 0) {
+        detector.alertFrames--;
+    }
+
+    // 좌우 차선을 검출하지 못한 경우 감지하지 않음
+    if (!position.valid) {
+        detector.deviationFrames = 0;
+        return false;
+    }
+
+    // 감지 기준값
+    const double CENTER_THRESHOLD = 0.03;  // 중앙으로 판단할 범위
+    const double CHANGE_THRESHOLD = 0.08;  // 중앙에서 벗어난 기준
+    const int CENTER_REQUIRED = 10;        // 중앙에 머물러야 하는 프레임 수
+    const int CHANGE_REQUIRED = 8;         // 이탈 상태가 지속되어야 하는 프레임 수
+
+    double offset = std::abs(position.offsetRatio);
+
+    // 1. 차선 중심이 기준 중앙에 위치한 경우
+    if (offset <= CENTER_THRESHOLD) {
+        detector.centerFrames++;
+        detector.deviationFrames = 0;
+
+        // 일정 시간 중앙에 있으면 감지 준비 완료
+        if (detector.centerFrames >= CENTER_REQUIRED) {
+            detector.armed = true;
+        }
+    }
+
+    // 2. 차선 중심이 기준에서 크게 벗어난 경우
+    else if (offset >= CHANGE_THRESHOLD) {
+        detector.centerFrames = 0;
+        detector.deviationFrames++;
+    }
+
+    // 3. 중앙과 이탈 기준 사이의 애매한 구간
+    else {
+        detector.centerFrames = 0;
+        detector.deviationFrames = 0;
+    }
+
+    // 4. 이탈 상태가 일정 시간 지속되면 차선 변경 감지
+    if (detector.armed &&
+        detector.deviationFrames >= CHANGE_REQUIRED) {
+
+        detector.armed = false;
+        detector.centerFrames = 0;
+        detector.deviationFrames = 0;
+
+        // 알림 표시 시간 설정
+        detector.alertFrames = 45;
+
+        return true;
+    }
+
+    return false;
+}
 }  // namespace lane
 
 // 6. main: 프레임 루프, 디버그 화면, 튜닝 UI
@@ -382,6 +643,8 @@ int main(int argc, char** argv) {
     double stageSec = 0.0, fps = 0.0;
     int n = 0;
     bool paused = false;
+    // 차선 변경 감지 상태
+    lane::LaneChangeDetector laneChangeDetector;
 
     while (true) {
         if (!paused) {
@@ -404,7 +667,53 @@ int main(int argc, char** argv) {
         // TODO(경고 담당):   warning = checkDeparture(lines, frame.size());
         // pre.roiEdges 는 ROI 밖이 0인 8비트 엣지 맵이며, 좌표계는 frame 과 동일하다.
         // ----------------------------------------------------------------------------
+        // ---- 허프 변환 ------------------------------------------------------------
+        vector<Vec4i> lines = lane::detectLines(pre.roiEdges);
 
+        // 검출된 선분을 원본 프레임에 표시
+        lane::LanePosition position =
+            lane::drawRepresentativeLaneLines(
+                frame,
+                lines,
+                pre.roiPolygon
+            );
+
+        // 오프셋 표시
+        if (position.valid) {
+            putText(
+                frame,
+                format(
+                    "Offset: %.1f px (%.1f%%)",
+                    position.offsetPx,
+                    position.offsetRatio * 100.0
+                ),
+                Point(30, 50),
+                FONT_HERSHEY_SIMPLEX,
+                0.8,
+                Scalar(0, 255, 255),
+                2,
+                LINE_AA
+            );
+        }
+        // 차선 변경 감지
+        if (lane::updateLaneChangeDetector(position, laneChangeDetector)) {
+            std::cout << "차선 변경 감지!" << endl;
+        }
+
+        // 차선 변경 알림 표시
+        if (laneChangeDetector.alertFrames > 0) {
+            putText(
+                frame,
+                "LANE CHANGE DETECTED!",
+                Point(30, 100),
+                FONT_HERSHEY_SIMPLEX,
+                1.0,
+                Scalar(0, 0, 255),
+                3,
+                LINE_AA
+            );
+        }
+        // ----------------------------------------------------------------------------
         if (display || sink.isOpened()) {
             Mat view = makeDebugView(frame, pre, fps);
             if (sink.isOpened()) sink.write(view);
