@@ -1,0 +1,6 @@
+build/
+out/
+.vscode/
+.vs/
+CMakeUserPresets.json
+*.mp4
