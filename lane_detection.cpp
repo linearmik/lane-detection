@@ -19,7 +19,7 @@ using namespace std;
 using namespace cv;
 
 // 화면 오른쪽 아래에 표시되는 코드 버전 (어떤 코드로 빌드된 exe인지 확인용)
-const char* kCodeVersion = "r6 color-mask";
+const char* kCodeVersion = "r7 no-dark";
 
 namespace lane {
 
@@ -71,6 +71,9 @@ inline bool operator!=(const RoiParams& a, const RoiParams& b) { return !(a == b
 // 문제 3) 색이 바랜 노란 중앙선은 흑백 대비가 약하다.
 //   -> min(R, G) - B 채널(노란색일수록 큼)에도 같은 ridge. 회색 가드레일·노면은 0에 가깝다.
 // 각 ridge를 임계값으로 이진화해 OR -> "차선 색 마스크" (흰색/파란색/노란색 = 255, 나머지 = 0).
+// 단, 양옆보다 어두운 픽셀은 색과 상관없이 제외한다. 검은 타르 보수 자국은 살짝 푸른 검정이라
+// (회색값 20, B - R = +14, 노면은 회색값 63, B - R = -6) 파란 차선으로 판정됐다.
+// 차선 페인트는 노면보다 밝거나 비슷하지, 훨씬 어둡지 않다.
 // 이 마스크가 Canny 입력이다. 약한 밝기 차(이음매 주변, 노면 얼룩)는 임계값 아래라 아예 사라진다.
 // 흰색을 RGB 절대값(예: 200 이상)으로 정하지 않는 이유: 해질녘·그림자 속 흰 차선은 회색값이
 // 90 정도라 절대값 기준이면 사라진다. 그래서 "양옆 노면보다 얼마나 밝은가"로 정한다.
@@ -79,9 +82,10 @@ struct LaneFeatureParams {
     double ridgeOffset = 0.015;   // 비교 거리 d (프레임 가로 비율, 960px 기준 14px). 차선 폭보다 크게
     int whiteMin = 25;            // 흰 차선: 양옆보다 회색값이 이만큼 이상 밝음
     bool blue = true;             // 파란 차선 채널 사용
-    int blueMin = 10;             // 파란 차선: (B - R)가 양옆보다 이만큼 이상 큼 (차선 +20~30)
+    int blueMin = 15;             // 파란 차선: (B - R)가 양옆보다 이만큼 이상 큼 (차선 +25~70)
     bool yellow = true;           // 노란 차선 채널 사용
     int yellowMin = 12;           // 노란 차선: (min(R, G) - B)가 양옆보다 이만큼 이상 큼
+    int darkTol = 8;              // 양옆보다 회색값이 이만큼 넘게 어두우면 색과 상관없이 차선 아님
 };
 
 struct PipelineConfig {
@@ -295,6 +299,14 @@ private:
         threshold(ridge(result_.blurred, d), result_.feature, p.whiteMin - 1, 255, THRESH_BINARY);
 
         if (!p.blue && !p.yellow) return;
+
+        // 양옆보다 어두운 픽셀 (타르 자국, 이음매): min(I(x-d), I(x+d)) - I(x) > darkTol
+        Mat padded, nbMin, darker, notDark;
+        copyMakeBorder(result_.blurred, padded, 0, 0, d, d, BORDER_REPLICATE);
+        cv::min(padded(Rect(0, 0, bgrFrame.cols, bgrFrame.rows)),
+                padded(Rect(2 * d, 0, bgrFrame.cols, bgrFrame.rows)), nbMin);
+        subtract(nbMin, result_.blurred, darker);
+        threshold(darker, notDark, p.darkTol, 255, THRESH_BINARY_INV);
         Mat ch[3];  // B, G, R
         split(bgrFrame, ch);
 
@@ -303,6 +315,7 @@ private:
             Mat blurred, bin;
             GaussianBlur(colorMap, blurred, Size(blurK, blurK), cfg_.blur.sigma);
             threshold(ridge(blurred, d), bin, minValue - 1, 255, THRESH_BINARY);
+            bitwise_and(bin, notDark, bin);  // 어두운 픽셀은 색이 맞아도 제외
             bitwise_or(result_.feature, bin, result_.feature);
         };
         if (p.blue) {  // 파란 차선 (버스전용차로)
