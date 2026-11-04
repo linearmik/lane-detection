@@ -19,7 +19,7 @@ using namespace std;
 using namespace cv;
 
 // 화면 오른쪽 아래에 표시되는 코드 버전 (어떤 코드로 빌드된 exe인지 확인용)
-const char* kCodeVersion = "r8 warn25";
+const char* kCodeVersion = "r9 auto-center";
 
 namespace lane {
 
@@ -652,20 +652,31 @@ LanePosition computeLanePosition(const LaneLines& lanes, const vector<Point>& ro
 
 // 차량(카메라) 중심 자동 보정
 //   블랙박스는 차량 정중앙에 달려 있지 않은 경우가 많아, 화면 중앙을 차량 위치로 쓰면
-//   똑바로 달려도 오프셋이 생긴다. 처음 needFrames 동안 검출된 차선 중앙의 평균을
-//   "차선 가운데로 주행할 때의 위치"로 보고 기준점으로 쓴다 (처음엔 정상 주행 중이라고 가정).
+//   똑바로 달려도 오프셋이 생긴다.
+//   1) 처음 needFrames 동안 검출된 차선 중앙의 평균을 차량 위치로 쓴다 (정상 주행 중이라고 가정)
+//   2) 그 뒤에도 차선 중앙을 아주 천천히(시간 상수 약 10초) 따라간다.
+//      처음 2초에 차선을 잘못 잡았거나 차가 살짝 치우쳐 있었으면 기준점이 계속 틀어진 채로 남아
+//      직진 중에도 이탈 경고가 났다 (실제 영상: 보정값 0.49, 실제 차선 중앙 0.40).
+//      실제 이탈·차선 변경은 1~3초라 기준점이 거의 움직이지 않고, 경고 중에는 따라가지 않는다.
 struct CarCenterCalibrator {
-    int needFrames = 60;  // 약 2초 (30fps)
+    int needFrames = 60;      // 약 2초 (30fps)
+    double follow = 1.0 / 300; // 보정 후 따라가는 비율 (30fps 기준 약 10초)
+    bool fixed = false;       // --car-x 로 고정했으면 따라가지 않음
     int count = 0;
     double sum = 0.0;
-    double carX = -1.0;   // 0 이상이면 보정 완료(또는 수동 지정)
+    double carX = -1.0;       // 0 이상이면 보정 완료(또는 수동 지정)
 
     bool done() const { return carX >= 0.0; }
 
-    void add(const LanePosition& position) {
-        if (done() || !position.valid) return;
-        sum += position.laneCenterX;
-        if (++count >= needFrames) carX = sum / count;
+    // warning: 지금 이탈 경고 중인지 (경고 중에는 기준점을 움직이지 않는다)
+    void add(const LanePosition& position, bool warning) {
+        if (!position.valid) return;
+        if (!done()) {
+            sum += position.laneCenterX;
+            if (++count >= needFrames) carX = sum / count;
+        } else if (!fixed && !warning) {
+            carX += follow * (position.laneCenterX - carX);
+        }
     }
 };
 
@@ -678,8 +689,8 @@ enum class Departure { None, Left, Right };
 struct DepartureWarning {
     // 기준은 차선 폭 대비 비율. 0.5면 차량 중심이 차선 위에 올라간 것.
     // 승용차 폭(~1.8m)과 차선 폭(~3.5m)을 생각하면 0.2 정도부터 바퀴가 차선에 가까워진다.
-    double onRatio = 0.25;   // |오프셋 / 차선 폭| 이 이 값을 넘으면 이탈 후보 (20%는 직진 중 오경보)
-    double offRatio = 0.18;  // 이 값 아래로 돌아오면 경고 해제
+    double onRatio = 0.20;   // |오프셋 / 차선 폭| 이 이 값을 넘으면 이탈 후보
+    double offRatio = 0.14;  // 이 값 아래로 돌아오면 경고 해제
     int onFrames = 8;        // 연속으로 넘어야 경고를 켜는 프레임 수 (30fps 기준 약 0.27초)
 
     Departure state = Departure::None;
@@ -797,12 +808,13 @@ bool updateLaneChangeDetector(
 
     // 감지 기준값
     // 차선 폭 대비 오프셋 기준 (처음에는 ROI 폭 대비 0.03 / 0.08이었는데, 차선 폭으로 치면
-    // 약 5% / 13%라 직진 중 흔들림에도 감지됐다. 이탈 경고(25%)보다 크게 잡아,
-    // 경고가 먼저 뜨고 그 상태로 차선 가까이(35%) 계속 가야 차선 변경으로 본다)
+    // 약 5% / 13%라 직진 중 흔들림에도 감지됐다. 이탈 경고(20%)보다 크게 잡아,
+    // 경고가 먼저 뜨고 그 상태로 차선 가까이(30%) 계속 가야 차선 변경으로 본다.
+    // 35% / 8프레임으로 했을 때는 실제 차선 변경을 놓쳐서 30% / 6프레임으로 조정)
     const double CENTER_THRESHOLD = 0.10;  // 중앙으로 판단할 범위
-    const double CHANGE_THRESHOLD = 0.35;  // 중앙에서 벗어난 기준
+    const double CHANGE_THRESHOLD = 0.30;  // 중앙에서 벗어난 기준
     const int CENTER_REQUIRED = 10;        // 중앙에 머물러야 하는 프레임 수
-    const int CHANGE_REQUIRED = 8;         // 이탈 상태가 지속되어야 하는 프레임 수
+    const int CHANGE_REQUIRED = 6;         // 이탈 상태가 지속되어야 하는 프레임 수
 
     double offset = std::abs(position.laneOffsetRatio);
 
@@ -1024,7 +1036,10 @@ int main(int argc, char** argv) {
     lane::Departure departure = lane::Departure::None;
 
     const double carXRatio = args.get<double>("car-x");
-    if (carXRatio >= 0.0 && carXRatio <= 1.0) calib.carX = carXRatio * frameSize.width;
+    if (carXRatio >= 0.0 && carXRatio <= 1.0) {
+        calib.carX = carXRatio * frameSize.width;
+        calib.fixed = true;
+    }
 
     while (true) {
         const bool newFrame = !paused;
@@ -1060,8 +1075,8 @@ int main(int argc, char** argv) {
             lanes = tracker.update(measured);
             // 보정 중에는 이탈 경고를 하지 않는다
             position = lane::computeLanePosition(lanes, pre.roiPolygon, carX);
-            calib.add(position);
             departure = calib.done() ? departureWarning.update(position) : lane::Departure::None;
+            calib.add(position, departure != lane::Departure::None);
             if (lane::updateLaneChangeDetector(position, laneChangeDetector)) {
                 cout << "차선 변경 감지! (frame " << n << ")" << endl;
             }
