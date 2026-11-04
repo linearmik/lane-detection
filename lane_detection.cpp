@@ -16,7 +16,6 @@ const char* kCodeVersion = "r10 no-flip";
 
 namespace lane {
 
-// 1. 설정: 모든 좌표는 프레임 크기에 대한 비율(0~1)
 struct BlurParams {
     int kernel = 5;
     double sigma = 0.0;
@@ -47,7 +46,6 @@ inline bool operator==(const RoiParams& a, const RoiParams& b) {
 }
 inline bool operator!=(const RoiParams& a, const RoiParams& b) { return !(a == b); }
 
-// 차선 색 마스크 (흰/파란/노란 차선 = 255, 나머지 = 0)
 struct LaneFeatureParams {
     bool enabled = true;
     double ridgeOffset = 0.015;
@@ -66,7 +64,6 @@ struct PipelineConfig {
     LaneFeatureParams feature;
 };
 
-// ROI 프리셋: highway(clip1~3), city(clip4, videoplayback)
 bool applyRoiPreset(const string& name, PipelineConfig& cfg) {
     if (name == "highway") {
         cfg.roi = {0.60, 0.90, 0.41, 0.50, 0.12, 0.80};
@@ -79,7 +76,6 @@ bool applyRoiPreset(const string& name, PipelineConfig& cfg) {
     return false;
 }
 
-// 2. 영상 입출력
 class VideoSource {
 public:
     bool open(const string& path, int processWidth = 960) {
@@ -130,7 +126,6 @@ private:
     VideoWriter writer_;
 };
 
-// 3. ROI (꼭짓점 순서: 좌하, 좌상, 우상, 우하)
 vector<Point> makeRoiPolygon(Size s, const RoiParams& r) {
     const int topY = static_cast<int>(r.topY * s.height);
     const int botY = static_cast<int>(r.bottomY * s.height);
@@ -165,7 +160,6 @@ private:
     vector<Point> polygon_;
 };
 
-// 4. Canny 엣지 검출
 void computeAdaptiveThresholds(const Mat& gray, double sigma, double& low, double& high) {
     int hist[256] = {0};
     for (int y = 0; y < gray.rows; ++y) {
@@ -195,7 +189,6 @@ Mat detectEdges(const Mat& blurredGray, const CannyParams& p, double* usedLow = 
     return edges;
 }
 
-// 5. 전처리: BGR -> Gray -> Blur -> 차선 색 마스크 -> Canny -> ROI
 struct PreprocessResult {
     Mat gray;
     Mat blurred;
@@ -219,7 +212,6 @@ public:
         if (k % 2 == 0) ++k;
         GaussianBlur(result_.gray, result_.blurred, Size(k, k), cfg_.blur.sigma);
 
-        // ROI 경계가 엣지로 잡히지 않도록 Canny 후에 ROI 적용
         if (cfg_.feature.enabled) {
             makeLaneFeature(bgrFrame, k);
             result_.edges =
@@ -291,7 +283,6 @@ private:
     RoiMasker masker_;
     PreprocessResult result_;
 };
-// 6. 허프 변환: ROI 엣지 영상에서 직선 선분 검출
 vector<Vec4i> detectLines(const Mat& roiEdges) {
     vector<Vec4i> lines;
 
@@ -300,9 +291,9 @@ vector<Vec4i> detectLines(const Mat& roiEdges) {
         lines,
         1,
         CV_PI / 180,
-        30,             // threshold
-        30,             // minLineLength
-        20              // maxLineGap
+        30,
+        30,
+        20
     );
 
     return lines;
@@ -350,7 +341,6 @@ struct LaneSegment {
     double slope, intercept, xb, length;
 };
 
-// 선분 묶음 중 차량에서 가장 가까운(안쪽) 차선 선택
 bool pickLane(vector<LaneSegment>& segs, bool isLeft, double groupGapPx, double minSupport,
               double innerLimit, const double* priorXb, double gatePx,
               double& slope, double& intercept) {
@@ -468,7 +458,6 @@ LaneLines estimateLaneLines(
         lanes.rightFound = true;
     }
 
-    // 좌우가 교차하면 버림
     if (lanes.valid() &&
         (lanes.leftTopX >= lanes.rightTopX || lanes.leftBottomX >= lanes.rightBottomX)) {
         lanes.leftFound = lanes.rightFound = false;
@@ -476,7 +465,6 @@ LaneLines estimateLaneLines(
     return lanes;
 }
 
-// 프레임 간 차선 안정화
 class LaneTracker {
 public:
     double alpha = 0.25;
@@ -568,7 +556,6 @@ LanePosition computeLanePosition(const LaneLines& lanes, const vector<Point>& ro
     return position;
 }
 
-// 차량(카메라) 중심 자동 보정
 struct CarCenterCalibrator {
     int needFrames = 60;
     double follow = 1.0 / 300;
@@ -627,7 +614,7 @@ struct DepartureWarning {
         } else if (abs(r) < offRatio) {
             state = Departure::None;
             count = 0;
-        } else if (dir != state) {  // 차선을 넘어감
+        } else if (dir != state) {
             state = Departure::None;
             count = 0;
             needRecenter = true;
@@ -753,9 +740,8 @@ bool updateLaneChangeDetector(
 
     return false;
 }
-}  // namespace lane
+}
 
-// 7. main
 namespace {
 
 const char* kKeys =
@@ -780,7 +766,7 @@ const char* kKeys =
 struct TuneState {
     int blur = 5;
     int cannyLow = 30, cannyHigh = 90;
-    int topY = 60, bottomY = 90, topL = 42, topR = 58, botL = 3, botR = 97;  // %
+    int topY = 60, bottomY = 90, topL = 42, topR = 58, botL = 3, botR = 97;
 
     void load(const lane::PipelineConfig& c) {
         blur = c.blur.kernel;
@@ -848,7 +834,7 @@ Mat makeDebugView(const Mat& result, const lane::PreprocessResult& r, const vect
     return both;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
     CommandLineParser args(argc, argv, kKeys);
@@ -942,7 +928,6 @@ int main(int argc, char** argv) {
 
         if (tune) tuneState.store(pipeline.config());
 
-        // 처리 시간 측정: 전처리 ~ 이탈 판정
         procTimer.reset();
         procTimer.start();
 
@@ -976,7 +961,6 @@ int main(int argc, char** argv) {
             if (t > 0) fps = (n == 0) ? 1.0 / t : 0.9 * fps + 0.1 / t;
         }
 
-        // 원본 frame에 그리면 다음 처리에 섞이므로 복사본에 그림
         if (display || sink.isOpened()) {
             view = frame.clone();
             lane::drawLaneOverlay(view, lanes, position, departure);
