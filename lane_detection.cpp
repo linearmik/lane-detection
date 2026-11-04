@@ -57,22 +57,25 @@ inline bool operator!=(const RoiParams& a, const RoiParams& b) { return !(a == b
 //
 // 문제 1) 흑백 영상에 바로 Canny를 하면 밝기가 바뀌는 곳은 전부 엣지가 된다.
 //         노면 이음매·타이어 자국(어두운 줄), 그림자 경계, 갓길 경계가 차선만큼 강하게 잡힌다.
-//   -> 차선 페인트는 항상 "주변 노면보다 밝은, 가는 띠"다. 가로 방향 Top-hat
-//      (원본 - 열림 연산)을 하면 커널보다 가는 밝은 띠만 남고, 어두운 줄·넓은 그림자·
-//      밝기 계단(경계)은 0이 된다.
+//   -> 차선 페인트는 "양옆 노면보다 밝은, 가는 띠"다. 각 픽셀을 좌우로 d만큼 떨어진 두 픽셀과
+//      비교해 둘 다보다 밝은 만큼만 남긴다 (좌우 대칭 밝기 차, ridge):
+//          ridge(x) = max(0, min(I(x) - I(x - d), I(x) - I(x + d)))
+//      차선(양옆이 노면)은 양수, 밝기 계단(그림자·갓길 경계)과
+//      어두운 줄 옆 노면(한쪽만 어두움)은 0이 된다.
+//      (처음에는 Top-hat을 썼는데, 검은 이음매 옆 노면도 "주변 최솟값보다 밝은 띠"로 남았다)
 // 문제 2) 파란 차선(버스전용차로)은 흑백으로 바꾸면 노면과 밝기가 같다 (차선 88 vs 노면 86).
-//   -> B - R 채널에서는 차선 +20~30, 노면 0 이하로 차이가 크다. 이 채널에도 Top-hat을 해서
-//      (그림자처럼 넓게 푸른 영역은 제거) 흑백 Top-hat과 max로 합친다.
+//   -> B - R 채널에서는 차선 +20~30, 노면 0 이하로 차이가 크다. 이 채널에도 같은 ridge.
 // 문제 3) 색이 바랜 노란 중앙선은 흑백 대비가 약하다.
-//   -> min(R, G) - B 채널(노란색일수록 큼)에도 같은 Top-hat. 회색 가드레일·노면은 0에 가깝다.
+//   -> min(R, G) - B 채널(노란색일수록 큼)에도 같은 ridge. 회색 가드레일·노면은 0에 가깝다.
+// 세 결과의 픽셀별 max가 Canny 입력.
 struct LaneFeatureParams {
-    bool enabled = true;       // false면 기존 방식(흑백 영상에 바로 Canny)
-    double markWidth = 0.035;  // Top-hat 커널 가로 크기 (프레임 가로 비율). 차선 폭보다 넓게
-    double grayGain = 2.0;     // 흑백 Top-hat 증폭
-    bool blue = true;          // 파란 차선 채널 사용
-    double blueGain = 4.0;     // (B - R) 증폭
-    bool yellow = true;        // 노란 차선 채널 사용 (흐린 중앙선 강조, 회색 가드레일은 0)
-    double yellowGain = 3.0;   // (min(R, G) - B) 증폭
+    bool enabled = true;          // false면 기존 방식(흑백 영상에 바로 Canny)
+    double ridgeOffset = 0.015;   // 비교 거리 d (프레임 가로 비율, 960px 기준 14px). 차선 폭보다 크게
+    double grayGain = 2.0;        // 흑백 ridge 증폭
+    bool blue = true;             // 파란 차선 채널 사용
+    double blueGain = 4.0;        // (B - R) 증폭
+    bool yellow = true;           // 노란 차선 채널 사용
+    double yellowGain = 3.0;      // (min(R, G) - B) 증폭
 };
 
 struct PipelineConfig {
@@ -224,7 +227,7 @@ struct PreprocessResult {
     Mat gray;      // CV_8UC1
     Mat blurred;   // CV_8UC1
     Mat edges;     // ROI 적용 전 전체 프레임 엣지 (흑백 엣지 | 파란색 엣지)
-    Mat feature;   // 차선 특징 영상 (흑백 Top-hat 과 파란색 Top-hat 의 max). Canny 입력
+    Mat feature;   // 차선 특징 영상 (흑백/파란색/노란색 ridge 의 max). Canny 입력
     Mat roiEdges;  // ROI 밖은 0. HoughLinesP 입력. 좌표계는 입력 프레임과 동일
     vector<Point> roiPolygon;  // 좌하, 좌상, 우상, 우하
     double cannyLow = 0.0;
@@ -263,28 +266,38 @@ public:
     PipelineConfig& config() { return cfg_; }
 
 private:
-    // 차선 특징 영상 = max(흑백 Top-hat * grayGain, 파란색(B-R) Top-hat * blueGain)
+    // 좌우 대칭 밝기 차: max(0, min(I(x) - I(x-d), I(x) - I(x+d)))
+    //   8비트 subtract는 음수를 0으로 자르므로 그대로 쓰면 된다
+    static Mat ridge(const Mat& src, int d) {
+        Mat padded;
+        copyMakeBorder(src, padded, 0, 0, d, d, BORDER_REPLICATE);
+        const Mat leftN = padded(Rect(0, 0, src.cols, src.rows));       // I(x - d)
+        const Mat rightN = padded(Rect(2 * d, 0, src.cols, src.rows));  // I(x + d)
+        Mat a, b, out;
+        subtract(src, leftN, a);
+        subtract(src, rightN, b);
+        cv::min(a, b, out);
+        return out;
+    }
+
+    // 차선 특징 영상 = max(흑백 ridge * grayGain, 파란색(B-R) ridge * blueGain,
+    //                      노란색(min(R,G)-B) ridge * yellowGain)
     void makeLaneFeature(const Mat& bgrFrame, int blurK) {
         const LaneFeatureParams& p = cfg_.feature;
-        int kw = static_cast<int>(p.markWidth * bgrFrame.cols) | 1;  // 홀수
-        if (kw < 3) kw = 3;
-        const Mat kernel = getStructuringElement(MORPH_RECT, Size(kw, 1));
+        const int d = max(2, static_cast<int>(p.ridgeOffset * bgrFrame.cols));
 
-        Mat grayTop;
-        morphologyEx(result_.blurred, grayTop, MORPH_TOPHAT, kernel);
-        grayTop.convertTo(result_.feature, CV_8U, p.grayGain);
+        ridge(result_.blurred, d).convertTo(result_.feature, CV_8U, p.grayGain);
 
         if (!p.blue && !p.yellow) return;
         Mat ch[3];  // B, G, R
         split(bgrFrame, ch);
 
-        // 색 채널 하나를 블러 -> Top-hat -> 증폭해서 특징 영상에 max로 합친다
+        // 색 채널 하나를 블러 -> ridge -> 증폭해서 특징 영상에 max로 합친다
         auto addColor = [&](const Mat& colorMap, double gain) {
-            Mat blurred, top;
+            Mat blurred, scaled;
             GaussianBlur(colorMap, blurred, Size(blurK, blurK), cfg_.blur.sigma);
-            morphologyEx(blurred, top, MORPH_TOPHAT, kernel);
-            top.convertTo(top, CV_8U, gain);
-            result_.feature = max(result_.feature, top);
+            ridge(blurred, d).convertTo(scaled, CV_8U, gain);
+            result_.feature = max(result_.feature, scaled);
         };
         if (p.blue) {
             Mat diff;
@@ -762,12 +775,15 @@ bool updateLaneChangeDetector(
     }
 
     // 감지 기준값
-    const double CENTER_THRESHOLD = 0.03;  // 중앙으로 판단할 범위
-    const double CHANGE_THRESHOLD = 0.08;  // 중앙에서 벗어난 기준
+    // 차선 폭 대비 오프셋 기준 (처음에는 ROI 폭 대비 0.03 / 0.08이었는데, 차선 폭으로 치면
+    // 약 5% / 13%라 직진 중 흔들림에도 감지됐다. 이탈 경고(20%)보다 크게 잡아,
+    // 경고가 먼저 뜨고 그 상태로 차선 가까이(35%) 계속 가야 차선 변경으로 본다)
+    const double CENTER_THRESHOLD = 0.10;  // 중앙으로 판단할 범위
+    const double CHANGE_THRESHOLD = 0.35;  // 중앙에서 벗어난 기준
     const int CENTER_REQUIRED = 10;        // 중앙에 머물러야 하는 프레임 수
     const int CHANGE_REQUIRED = 8;         // 이탈 상태가 지속되어야 하는 프레임 수
 
-    double offset = std::abs(position.offsetRatio);
+    double offset = std::abs(position.laneOffsetRatio);
 
     // 1. 차선 중심이 기준 중앙에 위치한 경우
     if (offset <= CENTER_THRESHOLD) {
@@ -828,7 +844,7 @@ const char* kKeys =
     "{car-x     |-1    | 차량 중심 x 비율(0~1). 생략하면 처음 2초 동안 자동 보정}"
     "{no-blue   |      | 파란 차선 채널 끄기 (비교용)}"
     "{no-yellow |      | 노란 차선 채널 끄기 (비교용)}"
-    "{no-feature|      | 차선 특징 영상(Top-hat) 끄고 흑백 영상에 바로 Canny (비교용)}"
+    "{no-feature|      | 차선 특징 영상(ridge) 끄고 흑백 영상에 바로 Canny (비교용)}"
     "{no-display|      | 창 없이 실행(처리 속도 측정용)}"
     "{max-frames|0     | 처리할 최대 프레임 수(0=전체)}";
 
