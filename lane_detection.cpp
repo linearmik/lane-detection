@@ -19,7 +19,7 @@ using namespace std;
 using namespace cv;
 
 // 화면 오른쪽 아래에 표시되는 코드 버전 (어떤 코드로 빌드된 exe인지 확인용)
-const char* kCodeVersion = "r9 auto-center";
+const char* kCodeVersion = "r10 no-flip";
 
 namespace lane {
 
@@ -695,10 +695,19 @@ struct DepartureWarning {
 
     Departure state = Departure::None;
     int count = 0;
+    // 차선을 넘어간 뒤(차선 변경 완료) 새 차선 중앙(|r| < offRatio)으로 들어올 때까지 경고 금지.
+    //   왼쪽으로 차선을 바꾸면: 원래 차선 기준 LEFT 경고 -> 선을 넘는 순간 새 차선의 좌우 선을 잡는데,
+    //   새 차선 기준으로는 아직 오른쪽 끝이라 오프셋 부호가 뒤집혀 곧바로 RIGHT 경고가 났다.
+    bool needRecenter = false;
+
+    // 경고 중이거나 차선 변경 직후라 기준점(차량 위치)을 따라가면 안 되는 상태
+    bool active() const { return state != Departure::None || needRecenter; }
 
     Departure update(const LanePosition& position) {
-        // 한쪽 차선이라도 없으면 오경보를 막기 위해 판단 보류 (현재 상태 유지 안 함)
+        // 한쪽 차선이라도 없으면 오경보를 막기 위해 판단 보류.
+        // 경고 중에 차선을 놓쳤으면 (차선을 넘는 중일 가능성) 다시 중앙에 올 때까지 경고 금지
         if (!position.valid) {
+            if (state != Departure::None) needRecenter = true;
             count = 0;
             state = Departure::None;
             return state;
@@ -707,14 +716,23 @@ struct DepartureWarning {
         const double r = position.laneOffsetRatio;
         const Departure dir = r > 0 ? Departure::Left : Departure::Right;
 
+        if (needRecenter) {
+            if (abs(r) < offRatio) needRecenter = false;  // 새 차선 중앙에 들어옴 -> 다시 감시
+            count = 0;
+            state = Departure::None;
+            return state;
+        }
+
         if (state == Departure::None) {
             count = (abs(r) > onRatio) ? count + 1 : 0;
             if (count >= onFrames) state = dir;
-        } else if (abs(r) < offRatio) {
+        } else if (abs(r) < offRatio) {      // 원래 차선 중앙으로 복귀
             state = Departure::None;
             count = 0;
-        } else {
-            state = dir;
+        } else if (dir != state) {           // 경고 중 방향이 뒤집힘 = 차선을 넘어감
+            state = Departure::None;
+            count = 0;
+            needRecenter = true;
         }
         return state;
     }
@@ -1076,7 +1094,7 @@ int main(int argc, char** argv) {
             // 보정 중에는 이탈 경고를 하지 않는다
             position = lane::computeLanePosition(lanes, pre.roiPolygon, carX);
             departure = calib.done() ? departureWarning.update(position) : lane::Departure::None;
-            calib.add(position, departure != lane::Departure::None);
+            calib.add(position, departureWarning.active());
             if (lane::updateLaneChangeDetector(position, laneChangeDetector)) {
                 cout << "차선 변경 감지! (frame " << n << ")" << endl;
             }
