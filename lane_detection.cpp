@@ -320,6 +320,12 @@ struct LanePosition {
     double offsetRatio = 0.0;
     double laneOffsetRatio = 0.0;
 };
+struct LaneChangeDetector {
+    bool armed = false;
+    int centerFrames = 0;
+    int deviationFrames = 0;
+    int alertFrames = 0;
+};
 
 struct LaneLines {
     bool leftFound = false, rightFound = false;
@@ -680,6 +686,60 @@ void drawHud(Mat& frame, double fps, const LanePosition& position, Departure dep
         putText(frame, msg, org, FONT_HERSHEY_SIMPLEX, 1.1, Scalar(255, 255, 255), 3, LINE_AA);
     }
 }
+
+bool updateLaneChangeDetector(
+    const LanePosition& position,
+    LaneChangeDetector& detector
+) {
+    if (detector.alertFrames > 0) {
+        detector.alertFrames--;
+    }
+
+    if (!position.valid) {
+        detector.deviationFrames = 0;
+        return false;
+    }
+
+    const double CENTER_THRESHOLD = 0.10;
+    const double CHANGE_THRESHOLD = 0.30;
+    const int CENTER_REQUIRED = 10;
+    const int CHANGE_REQUIRED = 6;
+
+    double offset = std::abs(position.laneOffsetRatio);
+
+    if (offset <= CENTER_THRESHOLD) {
+        detector.centerFrames++;
+        detector.deviationFrames = 0;
+
+        if (detector.centerFrames >= CENTER_REQUIRED) {
+            detector.armed = true;
+        }
+    }
+
+    else if (offset >= CHANGE_THRESHOLD) {
+        detector.centerFrames = 0;
+        detector.deviationFrames++;
+    }
+
+    else {
+        detector.centerFrames = 0;
+        detector.deviationFrames = 0;
+    }
+
+    if (detector.armed &&
+        detector.deviationFrames >= CHANGE_REQUIRED) {
+
+        detector.armed = false;
+        detector.centerFrames = 0;
+        detector.deviationFrames = 0;
+
+        detector.alertFrames = 45;
+
+        return true;
+    }
+
+    return false;
+}
 }
 
 namespace {
@@ -847,6 +907,7 @@ int main(int argc, char** argv) {
 
     lane::LaneTracker tracker;
     lane::DepartureWarning departureWarning;
+    lane::LaneChangeDetector laneChangeDetector;
     lane::CarCenterCalibrator calib;
     lane::LaneLines lanes;
     lane::LanePosition position;
@@ -887,6 +948,9 @@ int main(int argc, char** argv) {
             position = lane::computeLanePosition(lanes, pre.roiPolygon, carX);
             departure = calib.done() ? departureWarning.update(position) : lane::Departure::None;
             calib.add(position, departureWarning.active());
+            if (lane::updateLaneChangeDetector(position, laneChangeDetector)) {
+                cout << "차선 변경 감지! (frame " << n << ")" << endl;
+            }
         }
 
         procTimer.stop();
@@ -901,6 +965,10 @@ int main(int argc, char** argv) {
             view = frame.clone();
             lane::drawLaneOverlay(view, lanes, position, departure);
             lane::drawHud(view, fps, position, departure, calib);
+            if (laneChangeDetector.alertFrames > 0) {
+                putText(view, "LANE CHANGE DETECTED", Point(20, 105), FONT_HERSHEY_SIMPLEX, 0.8,
+                        Scalar(0, 0, 255), 2, LINE_AA);
+            }
 
             if (sink.isOpened() && newFrame) {
                 sink.write(saveDebug ? makeDebugView(view, pre, lines) : view);
