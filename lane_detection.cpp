@@ -19,7 +19,7 @@ using namespace std;
 using namespace cv;
 
 // 화면 오른쪽 아래에 표시되는 코드 버전 (어떤 코드로 빌드된 exe인지 확인용)
-const char* kCodeVersion = "r7 no-dark";
+const char* kCodeVersion = "r8 warn25";
 
 namespace lane {
 
@@ -678,8 +678,8 @@ enum class Departure { None, Left, Right };
 struct DepartureWarning {
     // 기준은 차선 폭 대비 비율. 0.5면 차량 중심이 차선 위에 올라간 것.
     // 승용차 폭(~1.8m)과 차선 폭(~3.5m)을 생각하면 0.2 정도부터 바퀴가 차선에 가까워진다.
-    double onRatio = 0.20;   // |오프셋 / 차선 폭| 이 이 값을 넘으면 이탈 후보
-    double offRatio = 0.14;  // 이 값 아래로 돌아오면 경고 해제
+    double onRatio = 0.25;   // |오프셋 / 차선 폭| 이 이 값을 넘으면 이탈 후보 (20%는 직진 중 오경보)
+    double offRatio = 0.18;  // 이 값 아래로 돌아오면 경고 해제
     int onFrames = 8;        // 연속으로 넘어야 경고를 켜는 프레임 수 (30fps 기준 약 0.27초)
 
     Departure state = Departure::None;
@@ -797,7 +797,7 @@ bool updateLaneChangeDetector(
 
     // 감지 기준값
     // 차선 폭 대비 오프셋 기준 (처음에는 ROI 폭 대비 0.03 / 0.08이었는데, 차선 폭으로 치면
-    // 약 5% / 13%라 직진 중 흔들림에도 감지됐다. 이탈 경고(20%)보다 크게 잡아,
+    // 약 5% / 13%라 직진 중 흔들림에도 감지됐다. 이탈 경고(25%)보다 크게 잡아,
     // 경고가 먼저 뜨고 그 상태로 차선 가까이(35%) 계속 가야 차선 변경으로 본다)
     const double CENTER_THRESHOLD = 0.10;  // 중앙으로 판단할 범위
     const double CHANGE_THRESHOLD = 0.35;  // 중앙에서 벗어난 기준
