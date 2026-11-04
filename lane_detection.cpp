@@ -53,10 +53,19 @@ inline bool operator==(const RoiParams& a, const RoiParams& b) {
 }
 inline bool operator!=(const RoiParams& a, const RoiParams& b) { return !(a == b); }
 
+// 색 기반 엣지: 파란 차선(버스전용차로)은 흑백으로 바꾸면 아스팔트와 밝기가 거의 같아
+// Canny에 잡히지 않는다 (예: 차선 회색값 88 vs 노면 86). 그래서 B - R 채널을 따로 만들어
+// 엣지를 한 번 더 구하고 흑백 엣지와 합친다. 노면은 B - R <= 0, 파란 차선은 +20~30.
+struct ColorParams {
+    bool blueEdges = true;
+    double blueGain = 4.0;  // (B - R) 증폭 배율
+};
+
 struct PipelineConfig {
     BlurParams blur;
     CannyParams canny;
     RoiParams roi;
+    ColorParams color;
 };
 
 // 카메라 장착 위치에 맞춘 ROI 프리셋.
@@ -200,7 +209,8 @@ Mat detectEdges(const Mat& blurredGray, const CannyParams& p, double* usedLow = 
 struct PreprocessResult {
     Mat gray;      // CV_8UC1
     Mat blurred;   // CV_8UC1
-    Mat edges;     // ROI 적용 전 전체 프레임 엣지 (디버그용)
+    Mat edges;     // ROI 적용 전 전체 프레임 엣지 (흑백 엣지 | 파란색 엣지)
+    Mat blueness;  // (B - R) * gain, 파란 차선 강조 영상 (디버그용)
     Mat roiEdges;  // ROI 밖은 0. HoughLinesP 입력. 좌표계는 입력 프레임과 동일
     vector<Point> roiPolygon;  // 좌하, 좌상, 우상, 우하
     double cannyLow = 0.0;
@@ -224,6 +234,20 @@ public:
         // 전체 프레임에서 Canny를 한 뒤 엣지 맵에 마스크를 적용한다.
         result_.edges =
             detectEdges(result_.blurred, cfg_.canny, &result_.cannyLow, &result_.cannyHigh);
+
+        // 파란 차선 엣지: (B - R)를 증폭해 블러 후 같은 임계값으로 Canny, 흑백 엣지와 OR
+        if (cfg_.color.blueEdges) {
+            Mat ch[3];
+            split(bgrFrame, ch);
+            Mat diff;
+            subtract(ch[0], ch[2], diff);  // 8비트라 음수는 0으로 잘린다
+            diff.convertTo(result_.blueness, CV_8U, cfg_.color.blueGain);
+            GaussianBlur(result_.blueness, result_.blueness, Size(k, k), cfg_.blur.sigma);
+            Mat blueEdges;
+            Canny(result_.blueness, blueEdges, result_.cannyLow, result_.cannyHigh,
+                  cfg_.canny.aperture, cfg_.canny.l2gradient);
+            bitwise_or(result_.edges, blueEdges, result_.edges);
+        }
         result_.roiEdges = masker_.apply(result_.edges, cfg_.roi);
         result_.roiPolygon = masker_.polygon();
         return result_;
@@ -269,10 +293,12 @@ void drawLines(Mat& frame, const vector<Vec4i>& lines) {
 // 차선 중앙과 영상 중앙의 위치 정보
 struct LanePosition {
     bool valid = false;
-    double laneCenterX = 0.0;
-    double roiCenterX = 0.0;
-    double offsetPx = 0.0;
-    double offsetRatio = 0.0;
+    double laneCenterX = 0.0;      // 좌우 차선 하단 x의 중앙
+    double carCenterX = 0.0;       // 차량(카메라) 위치 x
+    double laneWidthPx = 0.0;      // ROI 하단에서의 차선 폭
+    double offsetPx = 0.0;         // 차선 중앙 - 차량 위치
+    double offsetRatio = 0.0;      // offsetPx / ROI 하단 너비 (차선 변경 감지용)
+    double laneOffsetRatio = 0.0;  // offsetPx / 차선 폭 (이탈 경고용, ±0.5면 차선 위)
 };
 // 차선 변경 감지 상태
 struct LaneChangeDetector {
@@ -288,15 +314,67 @@ struct LaneLines {
     double leftTopX = 0.0, leftBottomX = 0.0;
     double rightTopX = 0.0, rightBottomX = 0.0;
     int topY = 0, bottomY = 0;
+    bool leftInferred = false, rightInferred = false;  // 반대편 차선 + 차선 폭으로 추정한 값
 
     bool valid() const { return leftFound && rightFound; }
 };
 
-// 허프 선분을 좌우로 분류하고 길이 가중 평균으로 대표 차선을 계산 (그리기는 하지 않음)
+// 허프 선분 하나를 y = slope * x + intercept 와 ROI 하단에서의 x(xb)로 표현
+struct LaneSegment {
+    double slope, intercept, xb, length;
+};
+
+// 한쪽(좌 또는 우) 선분들 중 대표 차선 하나를 고른다.
+//   1) ROI 하단 x(xb)가 가까운 선분끼리 묶는다 (같은 차선의 양쪽 엣지, 점선 조각)
+//   2) 이전 프레임 차선(prior)이 있으면 그 근처(gatePx) 묶음만 후보로 둔다
+//   3) 남은 묶음 중 선분 길이 합이 가장 큰 묶음을 길이 가중 평균
+//   -> 노면 이음매, 그림자, 갓길 경계처럼 차선 옆의 약한 선이 섞여 평균이 끌려가는 것을 막는다
+bool pickLane(vector<LaneSegment>& segs, double groupGapPx, const double* priorXb, double gatePx,
+              double& slope, double& intercept) {
+    if (segs.empty()) return false;
+    sort(segs.begin(), segs.end(),
+         [](const LaneSegment& a, const LaneSegment& b) { return a.xb < b.xb; });
+
+    double bestLen = 0.0;
+    size_t bestBegin = 0, bestEnd = 0;
+    for (size_t i = 0; i < segs.size();) {
+        size_t j = i + 1;
+        while (j < segs.size() && segs[j].xb - segs[j - 1].xb <= groupGapPx) ++j;
+
+        double len = 0.0, xbSum = 0.0;
+        for (size_t t = i; t < j; ++t) {
+            len += segs[t].length;
+            xbSum += segs[t].xb * segs[t].length;
+        }
+        const double groupXb = xbSum / len;
+        const bool nearPrior = !priorXb || abs(groupXb - *priorXb) <= gatePx;
+        if (nearPrior && len > bestLen) {
+            bestLen = len;
+            bestBegin = i;
+            bestEnd = j;
+        }
+        i = j;
+    }
+    if (bestLen <= 0.0) return false;
+
+    double w = 0.0, sSum = 0.0, bSum = 0.0;
+    for (size_t t = bestBegin; t < bestEnd; ++t) {
+        sSum += segs[t].slope * segs[t].length;
+        bSum += segs[t].intercept * segs[t].length;
+        w += segs[t].length;
+    }
+    slope = sSum / w;
+    intercept = bSum / w;
+    return true;
+}
+
+// 허프 선분을 좌우로 분류하고 대표 차선을 계산 (그리기는 하지 않음)
+//   prior: 이전 프레임의 안정화된 차선 (없으면 nullptr)
 LaneLines estimateLaneLines(
     const vector<Vec4i>& lines,
     const vector<Point>& roiPolygon,
-    int frameWidth
+    int frameWidth,
+    const LaneLines* prior = nullptr
 ) {
     LaneLines lanes;
 
@@ -308,13 +386,11 @@ LaneLines estimateLaneLines(
     lanes.topY = roiPolygon[1].y;
     lanes.bottomY = roiPolygon[0].y;
     const double centerX = frameWidth / 2.0;
+    const double sideMargin = frameWidth * 0.08;  // 차선 위쪽 끝이 반대편으로 넘어가는 허용치
 
-    double leftSlopeSum = 0.0, leftInterceptSum = 0.0;
-    double rightSlopeSum = 0.0, rightInterceptSum = 0.0;
+    vector<LaneSegment> leftSegs, rightSegs;
 
-    double leftWeight = 0.0, rightWeight = 0.0;
-
-    // 1. 허프 변환 결과를 좌우 차선으로 분류
+    // 1. 허프 변환 결과를 좌우 차선 후보로 분류
     for (const Vec4i& l : lines) {
         double x1 = l[0], y1 = l[1];
         double x2 = l[2], y2 = l[3];
@@ -328,16 +404,16 @@ LaneLines estimateLaneLines(
         double midpointX = (x1 + x2) / 2.0;
         double length = norm(Point2d(x2 - x1, y2 - y1));
         double intercept = y1 - slope * x1;
+        double xb = (lanes.bottomY - intercept) / slope;  // ROI 하단에서의 x
+        double xt = (lanes.topY - intercept) / slope;     // ROI 상단에서의 x
 
-        if (slope < 0 && midpointX < centerX) {
-            leftSlopeSum += slope * length;
-            leftInterceptSum += intercept * length;
-            leftWeight += length;
+        // 차선은 위로 갈수록 소실점(화면 중앙 부근)으로 모인다.
+        // 위쪽 끝이 화면 중앙을 크게 넘어가는 선(보닛 테두리, 가로지르는 그림자 등)은 버린다.
+        if (slope < 0 && midpointX < centerX && xt <= centerX + sideMargin) {
+            leftSegs.push_back({slope, intercept, xb, length});
         }
-        else if (slope > 0 && midpointX > centerX) {
-            rightSlopeSum += slope * length;
-            rightInterceptSum += intercept * length;
-            rightWeight += length;
+        else if (slope > 0 && midpointX > centerX && xt >= centerX - sideMargin) {
+            rightSegs.push_back({slope, intercept, xb, length});
         }
     }
 
@@ -346,33 +422,74 @@ LaneLines estimateLaneLines(
         return (y - intercept) / slope;
     };
 
-    // 2. 좌우 각각 검출된 쪽만 대표 차선 계산 (한쪽만 잡혀도 추적기가 이어 준다)
-    if (leftWeight > 0) {
-        double s = leftSlopeSum / leftWeight;
-        double b = leftInterceptSum / leftWeight;
+    // 2. 좌우 각각 대표 차선 선택 (한쪽만 잡혀도 추적기가 이어 준다)
+    const double groupGap = frameWidth * 0.03;  // 같은 차선으로 묶는 간격
+    const double gate = frameWidth * 0.08;      // 이전 프레임 차선에서 허용하는 이동량
+    // 추정값(반대편 + 차선 폭)은 실제 위치와 다를 수 있으므로 후보 제한에 쓰지 않는다
+    const double* priorLeft =
+        (prior && prior->leftFound && !prior->leftInferred) ? &prior->leftBottomX : nullptr;
+    const double* priorRight =
+        (prior && prior->rightFound && !prior->rightInferred) ? &prior->rightBottomX : nullptr;
+    double s = 0.0, b = 0.0;
+
+    if (pickLane(leftSegs, groupGap, priorLeft, gate, s, b)) {
         lanes.leftTopX = getX(s, b, lanes.topY);
         lanes.leftBottomX = getX(s, b, lanes.bottomY);
         lanes.leftFound = true;
     }
-    if (rightWeight > 0) {
-        double s = rightSlopeSum / rightWeight;
-        double b = rightInterceptSum / rightWeight;
+    if (pickLane(rightSegs, groupGap, priorRight, gate, s, b)) {
         lanes.rightTopX = getX(s, b, lanes.topY);
         lanes.rightBottomX = getX(s, b, lanes.bottomY);
         lanes.rightFound = true;
     }
+
+    // 3. 좌우 차선이 ROI 안에서 교차하면 둘 다 믿을 수 없으므로 버린다 (추적기가 직전 값 유지)
+    if (lanes.valid() &&
+        (lanes.leftTopX >= lanes.rightTopX || lanes.leftBottomX >= lanes.rightBottomX)) {
+        lanes.leftFound = lanes.rightFound = false;
+    }
     return lanes;
 }
 
-// 프레임 간 차선 안정화: 지수이동평균(EMA) + 짧은 미검출 구간은 직전 값 유지
+// 프레임 간 차선 안정화
+//   1) 지수이동평균(EMA)으로 프레임마다 흔들리는 차선 위치를 부드럽게
+//   2) 짧은 미검출 구간(점선 사이 등)은 직전 값 유지
+//   3) 한쪽만 보이면 최근 차선 폭으로 반대편 위치를 추정
+//      (차가 한쪽으로 치우치면 반대편 차선이 ROI 밖으로 나가는데, 이때가 바로 이탈 상황이다)
 class LaneTracker {
 public:
     double alpha = 0.25;  // 새 측정값 반영 비율 (작을수록 안정, 클수록 빠른 반응)
-    int maxMiss = 10;     // 이 프레임 수까지는 못 찾아도 직전 차선 유지
+    int maxMiss = 15;     // 이 프레임 수까지는 못 찾아도 직전 차선 유지 (점선 사이 구간 대비)
 
-    const LaneLines& update(const LaneLines& m) {
+    const LaneLines& update(LaneLines m) {
+        // 양쪽 다 보이면 차선 폭(상단/하단)을 학습
+        if (m.valid()) {
+            const double wTop = m.rightTopX - m.leftTopX;
+            const double wBottom = m.rightBottomX - m.leftBottomX;
+            if (widthKnown_) {
+                widthTop_ = 0.1 * wTop + 0.9 * widthTop_;
+                widthBottom_ = 0.1 * wBottom + 0.9 * widthBottom_;
+            } else {
+                widthTop_ = wTop;
+                widthBottom_ = wBottom;
+                widthKnown_ = true;
+            }
+        }
+        // 한쪽만 보이면 반대편을 추정
+        if (widthKnown_ && m.leftFound && !m.rightFound) {
+            m.rightTopX = m.leftTopX + widthTop_;
+            m.rightBottomX = m.leftBottomX + widthBottom_;
+            m.rightFound = m.rightInferred = true;
+        } else if (widthKnown_ && m.rightFound && !m.leftFound) {
+            m.leftTopX = m.rightTopX - widthTop_;
+            m.leftBottomX = m.rightBottomX - widthBottom_;
+            m.leftFound = m.leftInferred = true;
+        }
+
         state_.topY = m.topY;
         state_.bottomY = m.bottomY;
+        state_.leftInferred = m.leftInferred;
+        state_.rightInferred = m.rightInferred;
         updateSide(m.leftFound, m.leftTopX, m.leftBottomX,
                    state_.leftFound, state_.leftTopX, state_.leftBottomX, leftMiss_);
         updateSide(m.rightFound, m.rightTopX, m.rightBottomX,
@@ -401,20 +518,22 @@ private:
 
     LaneLines state_;
     int leftMiss_ = 0, rightMiss_ = 0;
+    bool widthKnown_ = false;
+    double widthTop_ = 0.0, widthBottom_ = 0.0;
 };
 
-// 차선 중앙과 ROI 중앙(차량 위치)의 오프셋 계산
-LanePosition computeLanePosition(const LaneLines& lanes, const vector<Point>& roiPolygon) {
+// 차선 중앙과 차량 위치(carX)의 오프셋 계산
+LanePosition computeLanePosition(const LaneLines& lanes, const vector<Point>& roiPolygon,
+                                 double carX) {
     LanePosition position;
     if (!lanes.valid() || roiPolygon.size() < 4) {
         return position;
     }
 
-    // ROI 하단 기준으로 차선 중앙 계산
+    // ROI 하단 기준으로 차선 중앙과 차선 폭 계산
     position.laneCenterX = (lanes.leftBottomX + lanes.rightBottomX) / 2.0;
-
-    // ROI 하단의 좌우 경계 사이 중앙 계산 (카메라 = 차량 중앙 가정)
-    position.roiCenterX = (roiPolygon[0].x + roiPolygon[3].x) / 2.0;
+    position.laneWidthPx = lanes.rightBottomX - lanes.leftBottomX;
+    position.carCenterX = carX;
 
     // ROI 너비 계산
     double roiWidth = abs(roiPolygon[3].x - roiPolygon[0].x);
@@ -422,12 +541,36 @@ LanePosition computeLanePosition(const LaneLines& lanes, const vector<Point>& ro
         return {};
     }
 
-    // 두 중심 사이의 거리와 ROI 너비 대비 비율
-    position.offsetPx = position.laneCenterX - position.roiCenterX;
+    // 차선 폭이 말이 안 되면(너무 좁거나 넓음) 잘못 잡은 것으로 보고 판단하지 않는다
+    if (position.laneWidthPx < roiWidth * 0.3 || position.laneWidthPx > roiWidth * 1.5) {
+        return {};
+    }
+
+    position.offsetPx = position.laneCenterX - position.carCenterX;
     position.offsetRatio = position.offsetPx / roiWidth;
+    position.laneOffsetRatio = position.offsetPx / position.laneWidthPx;
     position.valid = true;
     return position;
 }
+
+// 차량(카메라) 중심 자동 보정
+//   블랙박스는 차량 정중앙에 달려 있지 않은 경우가 많아, 화면 중앙을 차량 위치로 쓰면
+//   똑바로 달려도 오프셋이 생긴다. 처음 needFrames 동안 검출된 차선 중앙의 평균을
+//   "차선 가운데로 주행할 때의 위치"로 보고 기준점으로 쓴다 (처음엔 정상 주행 중이라고 가정).
+struct CarCenterCalibrator {
+    int needFrames = 60;  // 약 2초 (30fps)
+    int count = 0;
+    double sum = 0.0;
+    double carX = -1.0;   // 0 이상이면 보정 완료(또는 수동 지정)
+
+    bool done() const { return carX >= 0.0; }
+
+    void add(const LanePosition& position) {
+        if (done() || !position.valid) return;
+        sum += position.laneCenterX;
+        if (++count >= needFrames) carX = sum / count;
+    }
+};
 
 // 차선 이탈 경고
 //   차선 중앙이 오른쪽(+)에 있으면 차량은 왼쪽으로 치우친 것 -> 왼쪽 이탈
@@ -436,9 +579,11 @@ LanePosition computeLanePosition(const LaneLines& lanes, const vector<Point>& ro
 enum class Departure { None, Left, Right };
 
 struct DepartureWarning {
-    double onRatio = 0.10;   // |오프셋 비율| 이 이 값을 넘으면 이탈 후보
-    double offRatio = 0.07;  // 이 값 아래로 돌아오면 경고 해제
-    int onFrames = 3;        // 연속으로 넘어야 경고를 켜는 프레임 수
+    // 기준은 차선 폭 대비 비율. 0.5면 차량 중심이 차선 위에 올라간 것.
+    // 승용차 폭(~1.8m)과 차선 폭(~3.5m)을 생각하면 0.2 정도부터 바퀴가 차선에 가까워진다.
+    double onRatio = 0.20;   // |오프셋 / 차선 폭| 이 이 값을 넘으면 이탈 후보
+    double offRatio = 0.14;  // 이 값 아래로 돌아오면 경고 해제
+    int onFrames = 8;        // 연속으로 넘어야 경고를 켜는 프레임 수 (30fps 기준 약 0.27초)
 
     Departure state = Departure::None;
     int count = 0;
@@ -451,7 +596,7 @@ struct DepartureWarning {
             return state;
         }
 
-        const double r = position.offsetRatio;
+        const double r = position.laneOffsetRatio;
         const Departure dir = r > 0 ? Departure::Left : Departure::Right;
 
         if (state == Departure::None) {
@@ -488,28 +633,36 @@ void drawLaneOverlay(
     }
 
     // 2. 좌우 대표 차선 (좌: 빨강, 우: 파랑). 영역 위에 그려 선명하게 유지
-    if (lanes.leftFound) cv::line(frame, lt, lb, Scalar(0, 0, 255), 5, LINE_AA);
-    if (lanes.rightFound) cv::line(frame, rt, rb, Scalar(255, 0, 0), 5, LINE_AA);
+    //    차선 폭으로 추정한 쪽은 얇게 그린다
+    if (lanes.leftFound)
+        cv::line(frame, lt, lb, Scalar(0, 0, 255), lanes.leftInferred ? 2 : 5, LINE_AA);
+    if (lanes.rightFound)
+        cv::line(frame, rt, rb, Scalar(255, 0, 0), lanes.rightInferred ? 2 : 5, LINE_AA);
 
-    // 3. 흰 점: 차선 중앙 / 노란 점: 차량 위치(ROI 중앙)
+    // 3. 흰 점: 차선 중앙 / 노란 점: 차량 위치
     if (position.valid) {
         circle(frame, Point(cvRound(position.laneCenterX), bottomY), 7,
                Scalar(255, 255, 255), FILLED, LINE_AA);
-        circle(frame, Point(cvRound(position.roiCenterX), bottomY), 7,
+        circle(frame, Point(cvRound(position.carCenterX), bottomY), 7,
                Scalar(0, 255, 255), FILLED, LINE_AA);
     }
 }
 
 // 화면 상단 정보: FPS, 오프셋, 이탈 경고 배너
-void drawHud(Mat& frame, double fps, const LanePosition& position, Departure departure) {
+void drawHud(Mat& frame, double fps, const LanePosition& position, Departure departure,
+             const CarCenterCalibrator& calib) {
     auto text = [&](const string& s, Point org, double scale, Scalar color, int thick) {
         putText(frame, s, org, FONT_HERSHEY_SIMPLEX, scale, Scalar(0, 0, 0), thick + 3, LINE_AA);
         putText(frame, s, org, FONT_HERSHEY_SIMPLEX, scale, color, thick, LINE_AA);
     };
 
     text(format("FPS: %.1f", fps), Point(20, 35), 0.8, Scalar(0, 255, 0), 2);
-    if (position.valid) {
-        text(format("Offset: %+.1f px (%+.1f%%)", position.offsetPx, position.offsetRatio * 100.0),
+    if (!calib.done()) {
+        text(format("Calibrating car center... %d/%d", calib.count, calib.needFrames),
+             Point(20, 70), 0.7, Scalar(200, 200, 200), 2);
+    } else if (position.valid) {
+        text(format("Offset: %+.0f px (%+.0f%% of lane)", position.offsetPx,
+                    position.laneOffsetRatio * 100.0),
              Point(20, 70), 0.7, Scalar(0, 255, 255), 2);
     } else {
         text("Lane: searching...", Point(20, 70), 0.7, Scalar(200, 200, 200), 2);
@@ -520,7 +673,7 @@ void drawHud(Mat& frame, double fps, const LanePosition& position, Departure dep
                                                         : "LANE DEPARTURE! RIGHT >>>";
         int base = 0;
         const Size ts = getTextSize(msg, FONT_HERSHEY_SIMPLEX, 1.1, 3, &base);
-        const Point org((frame.cols - ts.width) / 2, 130);  // 좌상단 FPS/오프셋 글자와 겹치지 않게
+        const Point org((frame.cols - ts.width) / 2, 175);  // 좌상단 FPS/오프셋/차선 변경 글자와 겹치지 않게
         rectangle(frame, org + Point(-12, base + 10), org + Point(ts.width + 12, -ts.height - 12),
                   Scalar(0, 0, 200), FILLED);
         putText(frame, msg, org, FONT_HERSHEY_SIMPLEX, 1.1, Scalar(255, 255, 255), 3, LINE_AA);
@@ -607,6 +760,8 @@ const char* kKeys =
     "{tune      |      | 트랙바로 파라미터 실시간 조절}"
     "{out       |      | 결과 영상 저장 경로. --out=demo.mp4 형식}"
     "{debug     |      | 디버그 화면(결과+엣지)으로 시작. --out과 같이 쓰면 디버그 화면 저장}"
+    "{car-x     |-1    | 차량 중심 x 비율(0~1). 생략하면 처음 2초 동안 자동 보정}"
+    "{no-blue   |      | 파란 차선 엣지 끄기 (비교용)}"
     "{no-display|      | 창 없이 실행(처리 속도 측정용)}"
     "{max-frames|0     | 처리할 최대 프레임 수(0=전체)}";
 
@@ -699,6 +854,7 @@ int main(int argc, char** argv) {
     cfg.canny.low = args.get<double>("low");
     cfg.canny.high = args.get<double>("high");
     cfg.canny.adaptive = args.has("auto");
+    cfg.color.blueEdges = !args.has("no-blue");
 
     lane::VideoSource source;
     if (!source.open(args.get<string>("@video"), args.get<int>("width"))) {
@@ -751,9 +907,13 @@ int main(int argc, char** argv) {
     lane::LaneTracker tracker;                     // 프레임 간 차선 안정화
     lane::DepartureWarning departureWarning;       // 차선 이탈 경고
     lane::LaneChangeDetector laneChangeDetector;   // 차선 변경 감지 (실험)
+    lane::CarCenterCalibrator calib;               // 차량 중심 자동 보정
     lane::LaneLines lanes;
     lane::LanePosition position;
     lane::Departure departure = lane::Departure::None;
+
+    const double carXRatio = args.get<double>("car-x");
+    if (carXRatio >= 0.0 && carXRatio <= 1.0) calib.carX = carXRatio * frameSize.width;
 
     while (true) {
         const bool newFrame = !paused;
@@ -777,14 +937,19 @@ int main(int argc, char** argv) {
         // 2) 허프 변환 + 좌우 대표 차선 (B)
         vector<Vec4i> lines = lane::detectLines(pre.roiEdges);
         const lane::LaneLines measured =
-            lane::estimateLaneLines(lines, pre.roiPolygon, frame.cols);
+            lane::estimateLaneLines(lines, pre.roiPolygon, frame.cols, &tracker.state());
 
         // 3) 안정화 + 오프셋 + 이탈 경고 + 차선 변경 감지
         //    일시정지 중에는 상태를 갱신하지 않는다 (같은 프레임이 반복되므로)
         if (newFrame) {
             lanes = tracker.update(measured);
-            position = lane::computeLanePosition(lanes, pre.roiPolygon);
-            departure = departureWarning.update(position);
+            // 보정 전에는 ROI 하단 중앙을 임시 차량 위치로 쓰고, 이탈 경고는 하지 않는다
+            const double carX = calib.done()
+                                    ? calib.carX
+                                    : (pre.roiPolygon[0].x + pre.roiPolygon[3].x) / 2.0;
+            position = lane::computeLanePosition(lanes, pre.roiPolygon, carX);
+            calib.add(position);
+            departure = calib.done() ? departureWarning.update(position) : lane::Departure::None;
             if (lane::updateLaneChangeDetector(position, laneChangeDetector)) {
                 cout << "차선 변경 감지! (frame " << n << ")" << endl;
             }
@@ -804,7 +969,7 @@ int main(int argc, char** argv) {
         if (display || sink.isOpened()) {
             view = frame.clone();
             lane::drawLaneOverlay(view, lanes, position, departure);
-            lane::drawHud(view, fps, position, departure);
+            lane::drawHud(view, fps, position, departure, calib);
             if (laneChangeDetector.alertFrames > 0) {
                 putText(view, "LANE CHANGE DETECTED", Point(20, 105), FONT_HERSHEY_SIMPLEX, 0.8,
                         Scalar(0, 0, 255), 2, LINE_AA);
@@ -836,6 +1001,10 @@ int main(int argc, char** argv) {
         printf("frames=%d  처리 해상도 %dx%d\n", n, frameSize.width, frameSize.height);
         printf("  전처리         %.2f ms/frame\n", preSec * 1000.0 / n);
         printf("  전체(~이탈판정) %.2f ms/frame  -> %.1f FPS\n", procMs, 1000.0 / procMs);
+        if (calib.done()) {
+            printf("  차량 중심 x = %.0f px (화면 가로의 %.2f)  -> 다음부터 --car-x=%.2f 로 고정 가능\n",
+                   calib.carX, calib.carX / frameSize.width, calib.carX / frameSize.width);
+        }
     }
     return 0;
 }
