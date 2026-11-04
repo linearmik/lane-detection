@@ -369,16 +369,26 @@ struct LaneSegment {
 
 // 한쪽(좌 또는 우) 선분들 중 대표 차선 하나를 고른다.
 //   1) ROI 하단 x(xb)가 가까운 선분끼리 묶는다 (같은 차선의 양쪽 엣지, 점선 조각)
-//   2) 이전 프레임 차선(prior)이 있으면 그 근처(gatePx) 묶음만 후보로 둔다
-//   3) 남은 묶음 중 선분 길이 합이 가장 큰 묶음을 길이 가중 평균
-//   -> 노면 이음매, 그림자, 갓길 경계처럼 차선 옆의 약한 선이 섞여 평균이 끌려가는 것을 막는다
-bool pickLane(vector<LaneSegment>& segs, double groupGapPx, const double* priorXb, double gatePx,
+//   2) 선분 길이 합이 minSupport 이상인 묶음만 후보 (짧은 잡음 제거)
+//   3) 후보 중 차량에서 가장 가까운(안쪽) 묶음을 고른다.
+//      바깥 차선은 길게 이어진 실선이고 내 차선 경계는 짧은 점선인 경우가 많아,
+//      "가장 긴 선"을 고르면 한 칸 바깥 차선을 잡는다.
+//      차량 바로 앞(innerLimit 안쪽)의 노면 표시(마름모, 화살표)는 후보에서 뺀다.
+//   4) 이전 차선(prior)보다 바깥으로 gatePx 이상 튀는 후보는 거부한다
+//      (점선이 잠깐 안 보일 때 바깥 차선으로 넘어가지 않도록. 안쪽으로 오는 것은 허용)
+//   5) 고른 묶음 안에서 길이 가중 평균
+//   isLeft: 왼쪽이면 안쪽 = xb가 큰 쪽, 오른쪽이면 안쪽 = xb가 작은 쪽
+bool pickLane(vector<LaneSegment>& segs, bool isLeft, double groupGapPx, double minSupport,
+              double innerLimit, const double* priorXb, double gatePx,
               double& slope, double& intercept) {
     if (segs.empty()) return false;
     sort(segs.begin(), segs.end(),
          [](const LaneSegment& a, const LaneSegment& b) { return a.xb < b.xb; });
 
-    double bestLen = 0.0;
+    // 안쪽일수록 큰 값이 되도록 부호를 맞춘다
+    const double dir = isLeft ? 1.0 : -1.0;
+    bool found = false;
+    double bestInner = 0.0;
     size_t bestBegin = 0, bestEnd = 0;
     for (size_t i = 0; i < segs.size();) {
         size_t j = i + 1;
@@ -390,15 +400,19 @@ bool pickLane(vector<LaneSegment>& segs, double groupGapPx, const double* priorX
             xbSum += segs[t].xb * segs[t].length;
         }
         const double groupXb = xbSum / len;
-        const bool nearPrior = !priorXb || abs(groupXb - *priorXb) <= gatePx;
-        if (nearPrior && len > bestLen) {
-            bestLen = len;
+        const double inner = dir * groupXb;
+        const bool supported = len >= minSupport;
+        const bool notTooInner = inner <= dir * innerLimit;
+        const bool notJumpOut = !priorXb || inner >= dir * *priorXb - gatePx;
+        if (supported && notTooInner && notJumpOut && (!found || inner > bestInner)) {
+            found = true;
+            bestInner = inner;
             bestBegin = i;
             bestEnd = j;
         }
         i = j;
     }
-    if (bestLen <= 0.0) return false;
+    if (!found) return false;
 
     double w = 0.0, sSum = 0.0, bSum = 0.0;
     for (size_t t = bestBegin; t < bestEnd; ++t) {
@@ -412,11 +426,13 @@ bool pickLane(vector<LaneSegment>& segs, double groupGapPx, const double* priorX
 }
 
 // 허프 선분을 좌우로 분류하고 대표 차선을 계산 (그리기는 하지 않음)
+//   carX : 차량(카메라) 위치 x. 좌우 차선을 고를 때 "안쪽"의 기준
 //   prior: 이전 프레임의 안정화된 차선 (없으면 nullptr)
 LaneLines estimateLaneLines(
     const vector<Vec4i>& lines,
     const vector<Point>& roiPolygon,
     int frameWidth,
+    double carX,
     const LaneLines* prior = nullptr
 ) {
     LaneLines lanes;
@@ -468,8 +484,10 @@ LaneLines estimateLaneLines(
     };
 
     // 2. 좌우 각각 대표 차선 선택 (한쪽만 잡혀도 추적기가 이어 준다)
-    const double groupGap = frameWidth * 0.03;  // 같은 차선으로 묶는 간격
-    const double gate = frameWidth * 0.08;      // 이전 프레임 차선에서 허용하는 이동량
+    const double groupGap = frameWidth * 0.03;    // 같은 차선으로 묶는 간격
+    const double minSupport = frameWidth * 0.04;  // 묶음의 최소 선분 길이 합
+    const double innerMargin = frameWidth * 0.06; // 차량 바로 앞 노면 표시 제외 폭
+    const double gate = frameWidth * 0.08;        // 이전 차선보다 바깥으로 튈 수 있는 허용치
     // 추정값(반대편 + 차선 폭)은 실제 위치와 다를 수 있으므로 후보 제한에 쓰지 않는다
     const double* priorLeft =
         (prior && prior->leftFound && !prior->leftInferred) ? &prior->leftBottomX : nullptr;
@@ -477,12 +495,14 @@ LaneLines estimateLaneLines(
         (prior && prior->rightFound && !prior->rightInferred) ? &prior->rightBottomX : nullptr;
     double s = 0.0, b = 0.0;
 
-    if (pickLane(leftSegs, groupGap, priorLeft, gate, s, b)) {
+    if (pickLane(leftSegs, true, groupGap, minSupport, carX - innerMargin, priorLeft, gate, s,
+                 b)) {
         lanes.leftTopX = getX(s, b, lanes.topY);
         lanes.leftBottomX = getX(s, b, lanes.bottomY);
         lanes.leftFound = true;
     }
-    if (pickLane(rightSegs, groupGap, priorRight, gate, s, b)) {
+    if (pickLane(rightSegs, false, groupGap, minSupport, carX + innerMargin, priorRight, gate, s,
+                 b)) {
         lanes.rightTopX = getX(s, b, lanes.topY);
         lanes.rightBottomX = getX(s, b, lanes.bottomY);
         lanes.rightFound = true;
@@ -984,18 +1004,19 @@ int main(int argc, char** argv) {
         preTimer.stop();
 
         // 2) 허프 변환 + 좌우 대표 차선 (B)
+        // 차량 위치: 보정 전에는 ROI 하단 중앙을 임시로 쓴다
+        const double carX = calib.done()
+                                ? calib.carX
+                                : (pre.roiPolygon[0].x + pre.roiPolygon[3].x) / 2.0;
         vector<Vec4i> lines = lane::detectLines(pre.roiEdges);
         const lane::LaneLines measured =
-            lane::estimateLaneLines(lines, pre.roiPolygon, frame.cols, &tracker.state());
+            lane::estimateLaneLines(lines, pre.roiPolygon, frame.cols, carX, &tracker.state());
 
         // 3) 안정화 + 오프셋 + 이탈 경고 + 차선 변경 감지
         //    일시정지 중에는 상태를 갱신하지 않는다 (같은 프레임이 반복되므로)
         if (newFrame) {
             lanes = tracker.update(measured);
-            // 보정 전에는 ROI 하단 중앙을 임시 차량 위치로 쓰고, 이탈 경고는 하지 않는다
-            const double carX = calib.done()
-                                    ? calib.carX
-                                    : (pre.roiPolygon[0].x + pre.roiPolygon[3].x) / 2.0;
+            // 보정 중에는 이탈 경고를 하지 않는다
             position = lane::computeLanePosition(lanes, pre.roiPolygon, carX);
             calib.add(position);
             departure = calib.done() ? departureWarning.update(position) : lane::Departure::None;
