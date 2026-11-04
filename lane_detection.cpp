@@ -18,6 +18,9 @@
 using namespace std;
 using namespace cv;
 
+// 화면 오른쪽 아래에 표시되는 코드 버전 (어떤 코드로 빌드된 exe인지 확인용)
+const char* kCodeVersion = "r6 color-mask";
+
 namespace lane {
 
 // 1. 설정: 모든 좌표는 프레임 크기에 대한 비율(0~1)
@@ -67,15 +70,18 @@ inline bool operator!=(const RoiParams& a, const RoiParams& b) { return !(a == b
 //   -> B - R 채널에서는 차선 +20~30, 노면 0 이하로 차이가 크다. 이 채널에도 같은 ridge.
 // 문제 3) 색이 바랜 노란 중앙선은 흑백 대비가 약하다.
 //   -> min(R, G) - B 채널(노란색일수록 큼)에도 같은 ridge. 회색 가드레일·노면은 0에 가깝다.
-// 세 결과의 픽셀별 max가 Canny 입력.
+// 각 ridge를 임계값으로 이진화해 OR -> "차선 색 마스크" (흰색/파란색/노란색 = 255, 나머지 = 0).
+// 이 마스크가 Canny 입력이다. 약한 밝기 차(이음매 주변, 노면 얼룩)는 임계값 아래라 아예 사라진다.
+// 흰색을 RGB 절대값(예: 200 이상)으로 정하지 않는 이유: 해질녘·그림자 속 흰 차선은 회색값이
+// 90 정도라 절대값 기준이면 사라진다. 그래서 "양옆 노면보다 얼마나 밝은가"로 정한다.
 struct LaneFeatureParams {
     bool enabled = true;          // false면 기존 방식(흑백 영상에 바로 Canny)
     double ridgeOffset = 0.015;   // 비교 거리 d (프레임 가로 비율, 960px 기준 14px). 차선 폭보다 크게
-    double grayGain = 2.0;        // 흑백 ridge 증폭
+    int whiteMin = 25;            // 흰 차선: 양옆보다 회색값이 이만큼 이상 밝음
     bool blue = true;             // 파란 차선 채널 사용
-    double blueGain = 4.0;        // (B - R) 증폭
+    int blueMin = 10;             // 파란 차선: (B - R)가 양옆보다 이만큼 이상 큼 (차선 +20~30)
     bool yellow = true;           // 노란 차선 채널 사용
-    double yellowGain = 3.0;      // (min(R, G) - B) 증폭
+    int yellowMin = 12;           // 노란 차선: (min(R, G) - B)가 양옆보다 이만큼 이상 큼
 };
 
 struct PipelineConfig {
@@ -227,7 +233,7 @@ struct PreprocessResult {
     Mat gray;      // CV_8UC1
     Mat blurred;   // CV_8UC1
     Mat edges;     // ROI 적용 전 전체 프레임 엣지 (흑백 엣지 | 파란색 엣지)
-    Mat feature;   // 차선 특징 영상 (흑백/파란색/노란색 ridge 의 max). Canny 입력
+    Mat feature;   // 차선 색 마스크 (흰색/파란색/노란색 = 255, 나머지 = 0). Canny 입력
     Mat roiEdges;  // ROI 밖은 0. HoughLinesP 입력. 좌표계는 입력 프레임과 동일
     vector<Point> roiPolygon;  // 좌하, 좌상, 우상, 우하
     double cannyLow = 0.0;
@@ -280,35 +286,35 @@ private:
         return out;
     }
 
-    // 차선 특징 영상 = max(흑백 ridge * grayGain, 파란색(B-R) ridge * blueGain,
-    //                      노란색(min(R,G)-B) ridge * yellowGain)
+    // 차선 색 마스크 = (흑백 ridge >= whiteMin) | (파란색 ridge >= blueMin) | (노란색 ridge >= yellowMin)
     void makeLaneFeature(const Mat& bgrFrame, int blurK) {
         const LaneFeatureParams& p = cfg_.feature;
         const int d = max(2, static_cast<int>(p.ridgeOffset * bgrFrame.cols));
 
-        ridge(result_.blurred, d).convertTo(result_.feature, CV_8U, p.grayGain);
+        // 흰 차선 (흑백 밝기)
+        threshold(ridge(result_.blurred, d), result_.feature, p.whiteMin - 1, 255, THRESH_BINARY);
 
         if (!p.blue && !p.yellow) return;
         Mat ch[3];  // B, G, R
         split(bgrFrame, ch);
 
-        // 색 채널 하나를 블러 -> ridge -> 증폭해서 특징 영상에 max로 합친다
-        auto addColor = [&](const Mat& colorMap, double gain) {
-            Mat blurred, scaled;
+        // 색 채널 하나를 블러 -> ridge -> 이진화해서 마스크에 OR
+        auto addColor = [&](const Mat& colorMap, int minValue) {
+            Mat blurred, bin;
             GaussianBlur(colorMap, blurred, Size(blurK, blurK), cfg_.blur.sigma);
-            ridge(blurred, d).convertTo(scaled, CV_8U, gain);
-            result_.feature = max(result_.feature, scaled);
+            threshold(ridge(blurred, d), bin, minValue - 1, 255, THRESH_BINARY);
+            bitwise_or(result_.feature, bin, result_.feature);
         };
-        if (p.blue) {
+        if (p.blue) {  // 파란 차선 (버스전용차로)
             Mat diff;
             subtract(ch[0], ch[2], diff);  // B - R (8비트라 음수는 0으로 잘린다)
-            addColor(diff, p.blueGain);
+            addColor(diff, p.blueMin);
         }
-        if (p.yellow) {
+        if (p.yellow) {  // 노란 중앙선
             Mat rg, diff;
             cv::min(ch[1], ch[2], rg);
             subtract(rg, ch[0], diff);     // min(R, G) - B
-            addColor(diff, p.yellowGain);
+            addColor(diff, p.yellowMin);
         }
     }
 
@@ -735,6 +741,8 @@ void drawHud(Mat& frame, double fps, const LanePosition& position, Departure dep
     };
 
     text(format("FPS: %.1f", fps), Point(20, 35), 0.8, Scalar(0, 255, 0), 2);
+    putText(frame, kCodeVersion, Point(frame.cols - 170, frame.rows - 12), FONT_HERSHEY_SIMPLEX,
+            0.5, Scalar(200, 200, 200), 1, LINE_AA);
     if (!calib.done()) {
         text(format("Calibrating car center... %d/%d", calib.count, calib.needFrames),
              Point(20, 70), 0.7, Scalar(200, 200, 200), 2);
@@ -895,13 +903,18 @@ void createTuneWindow(const char* win, TuneState& t) {
     addTrackbar(win, "roi bot-R x%", &t.botR, 100);
 }
 
-// 좌: 결과 화면 + ROI 외곽선, 우: ROI 적용된 엣지(허프 입력) + 허프 선분(빨강)
+// 좌: 결과 화면 + ROI 외곽선, 우: 차선 색 마스크 + 엣지(허프 입력) + 허프 선분(빨강)
 Mat makeDebugView(const Mat& result, const lane::PreprocessResult& r, const vector<Vec4i>& lines) {
     Mat left = result.clone();
     polylines(left, r.roiPolygon, true, Scalar(0, 255, 255), 2, LINE_AA);
 
+    // 오른쪽: ROI 안의 차선 색 마스크(회색) + Canny 엣지(흰색) + 허프 선분(빨강)
+    Mat roiMask = Mat::zeros(r.roiEdges.size(), CV_8UC1);
+    fillConvexPoly(roiMask, r.roiPolygon, Scalar(255));
+    Mat maskInRoi = Mat::zeros(r.roiEdges.size(), CV_8UC1);
+    r.feature.copyTo(maskInRoi, roiMask);
     Mat right;
-    cvtColor(r.roiEdges, right, COLOR_GRAY2BGR);
+    cvtColor(maskInRoi / 2 + r.roiEdges / 2, right, COLOR_GRAY2BGR);
     polylines(right, r.roiPolygon, true, Scalar(0, 255, 255), 1, LINE_AA);
     for (const Vec4i& l : lines) {
         cv::line(right, Point(l[0], l[1]), Point(l[2], l[3]), Scalar(0, 0, 255), 2, LINE_AA);
