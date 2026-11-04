@@ -53,19 +53,33 @@ inline bool operator==(const RoiParams& a, const RoiParams& b) {
 }
 inline bool operator!=(const RoiParams& a, const RoiParams& b) { return !(a == b); }
 
-// 색 기반 엣지: 파란 차선(버스전용차로)은 흑백으로 바꾸면 아스팔트와 밝기가 거의 같아
-// Canny에 잡히지 않는다 (예: 차선 회색값 88 vs 노면 86). 그래서 B - R 채널을 따로 만들어
-// 엣지를 한 번 더 구하고 흑백 엣지와 합친다. 노면은 B - R <= 0, 파란 차선은 +20~30.
-struct ColorParams {
-    bool blueEdges = true;
-    double blueGain = 4.0;  // (B - R) 증폭 배율
+// 차선 페인트 강조 (Canny 입력을 흑백 영상 대신 "차선 특징 영상"으로 바꾼다)
+//
+// 문제 1) 흑백 영상에 바로 Canny를 하면 밝기가 바뀌는 곳은 전부 엣지가 된다.
+//         노면 이음매·타이어 자국(어두운 줄), 그림자 경계, 갓길 경계가 차선만큼 강하게 잡힌다.
+//   -> 차선 페인트는 항상 "주변 노면보다 밝은, 가는 띠"다. 가로 방향 Top-hat
+//      (원본 - 열림 연산)을 하면 커널보다 가는 밝은 띠만 남고, 어두운 줄·넓은 그림자·
+//      밝기 계단(경계)은 0이 된다.
+// 문제 2) 파란 차선(버스전용차로)은 흑백으로 바꾸면 노면과 밝기가 같다 (차선 88 vs 노면 86).
+//   -> B - R 채널에서는 차선 +20~30, 노면 0 이하로 차이가 크다. 이 채널에도 Top-hat을 해서
+//      (그림자처럼 넓게 푸른 영역은 제거) 흑백 Top-hat과 max로 합친다.
+// 문제 3) 색이 바랜 노란 중앙선은 흑백 대비가 약하다.
+//   -> min(R, G) - B 채널(노란색일수록 큼)에도 같은 Top-hat. 회색 가드레일·노면은 0에 가깝다.
+struct LaneFeatureParams {
+    bool enabled = true;       // false면 기존 방식(흑백 영상에 바로 Canny)
+    double markWidth = 0.035;  // Top-hat 커널 가로 크기 (프레임 가로 비율). 차선 폭보다 넓게
+    double grayGain = 2.0;     // 흑백 Top-hat 증폭
+    bool blue = true;          // 파란 차선 채널 사용
+    double blueGain = 4.0;     // (B - R) 증폭
+    bool yellow = true;        // 노란 차선 채널 사용 (흐린 중앙선 강조, 회색 가드레일은 0)
+    double yellowGain = 3.0;   // (min(R, G) - B) 증폭
 };
 
 struct PipelineConfig {
     BlurParams blur;
     CannyParams canny;
     RoiParams roi;
-    ColorParams color;
+    LaneFeatureParams feature;
 };
 
 // 카메라 장착 위치에 맞춘 ROI 프리셋.
@@ -210,7 +224,7 @@ struct PreprocessResult {
     Mat gray;      // CV_8UC1
     Mat blurred;   // CV_8UC1
     Mat edges;     // ROI 적용 전 전체 프레임 엣지 (흑백 엣지 | 파란색 엣지)
-    Mat blueness;  // (B - R) * gain, 파란 차선 강조 영상 (디버그용)
+    Mat feature;   // 차선 특징 영상 (흑백 Top-hat 과 파란색 Top-hat 의 max). Canny 입력
     Mat roiEdges;  // ROI 밖은 0. HoughLinesP 입력. 좌표계는 입력 프레임과 동일
     vector<Point> roiPolygon;  // 좌하, 좌상, 우상, 우하
     double cannyLow = 0.0;
@@ -232,21 +246,14 @@ public:
 
         // 마스크를 블러 영상에 먼저 씌우면 ROI 경계가 강한 엣지로 잡히므로,
         // 전체 프레임에서 Canny를 한 뒤 엣지 맵에 마스크를 적용한다.
-        result_.edges =
-            detectEdges(result_.blurred, cfg_.canny, &result_.cannyLow, &result_.cannyHigh);
-
-        // 파란 차선 엣지: (B - R)를 증폭해 블러 후 같은 임계값으로 Canny, 흑백 엣지와 OR
-        if (cfg_.color.blueEdges) {
-            Mat ch[3];
-            split(bgrFrame, ch);
-            Mat diff;
-            subtract(ch[0], ch[2], diff);  // 8비트라 음수는 0으로 잘린다
-            diff.convertTo(result_.blueness, CV_8U, cfg_.color.blueGain);
-            GaussianBlur(result_.blueness, result_.blueness, Size(k, k), cfg_.blur.sigma);
-            Mat blueEdges;
-            Canny(result_.blueness, blueEdges, result_.cannyLow, result_.cannyHigh,
-                  cfg_.canny.aperture, cfg_.canny.l2gradient);
-            bitwise_or(result_.edges, blueEdges, result_.edges);
+        if (cfg_.feature.enabled) {
+            makeLaneFeature(bgrFrame, k);
+            result_.edges =
+                detectEdges(result_.feature, cfg_.canny, &result_.cannyLow, &result_.cannyHigh);
+        } else {
+            result_.feature = result_.blurred;
+            result_.edges =
+                detectEdges(result_.blurred, cfg_.canny, &result_.cannyLow, &result_.cannyHigh);
         }
         result_.roiEdges = masker_.apply(result_.edges, cfg_.roi);
         result_.roiPolygon = masker_.polygon();
@@ -256,6 +263,42 @@ public:
     PipelineConfig& config() { return cfg_; }
 
 private:
+    // 차선 특징 영상 = max(흑백 Top-hat * grayGain, 파란색(B-R) Top-hat * blueGain)
+    void makeLaneFeature(const Mat& bgrFrame, int blurK) {
+        const LaneFeatureParams& p = cfg_.feature;
+        int kw = static_cast<int>(p.markWidth * bgrFrame.cols) | 1;  // 홀수
+        if (kw < 3) kw = 3;
+        const Mat kernel = getStructuringElement(MORPH_RECT, Size(kw, 1));
+
+        Mat grayTop;
+        morphologyEx(result_.blurred, grayTop, MORPH_TOPHAT, kernel);
+        grayTop.convertTo(result_.feature, CV_8U, p.grayGain);
+
+        if (!p.blue && !p.yellow) return;
+        Mat ch[3];  // B, G, R
+        split(bgrFrame, ch);
+
+        // 색 채널 하나를 블러 -> Top-hat -> 증폭해서 특징 영상에 max로 합친다
+        auto addColor = [&](const Mat& colorMap, double gain) {
+            Mat blurred, top;
+            GaussianBlur(colorMap, blurred, Size(blurK, blurK), cfg_.blur.sigma);
+            morphologyEx(blurred, top, MORPH_TOPHAT, kernel);
+            top.convertTo(top, CV_8U, gain);
+            result_.feature = max(result_.feature, top);
+        };
+        if (p.blue) {
+            Mat diff;
+            subtract(ch[0], ch[2], diff);  // B - R (8비트라 음수는 0으로 잘린다)
+            addColor(diff, p.blueGain);
+        }
+        if (p.yellow) {
+            Mat rg, diff;
+            cv::min(ch[1], ch[2], rg);
+            subtract(rg, ch[0], diff);     // min(R, G) - B
+            addColor(diff, p.yellowGain);
+        }
+    }
+
     PipelineConfig cfg_;
     RoiMasker masker_;
     PreprocessResult result_;
@@ -399,7 +442,9 @@ LaneLines estimateLaneLines(
 
         double slope = (y2 - y1) / (x2 - x1);
 
-        if (abs(slope) < 0.3 || abs(slope) > 3.0) continue;
+        // 수평에 가까운 선(가드레일·정지선·그림자, |기울기| 0.3 안팎)과 수직에 가까운 선 제거.
+        // 테스트 영상의 실제 차선은 |기울기| 0.6~1.2
+        if (abs(slope) < 0.45 || abs(slope) > 3.0) continue;
 
         double midpointX = (x1 + x2) / 2.0;
         double length = norm(Point2d(x2 - x1, y2 - y1));
@@ -761,7 +806,9 @@ const char* kKeys =
     "{out       |      | 결과 영상 저장 경로. --out=demo.mp4 형식}"
     "{debug     |      | 디버그 화면(결과+엣지)으로 시작. --out과 같이 쓰면 디버그 화면 저장}"
     "{car-x     |-1    | 차량 중심 x 비율(0~1). 생략하면 처음 2초 동안 자동 보정}"
-    "{no-blue   |      | 파란 차선 엣지 끄기 (비교용)}"
+    "{no-blue   |      | 파란 차선 채널 끄기 (비교용)}"
+    "{no-yellow |      | 노란 차선 채널 끄기 (비교용)}"
+    "{no-feature|      | 차선 특징 영상(Top-hat) 끄고 흑백 영상에 바로 Canny (비교용)}"
     "{no-display|      | 창 없이 실행(처리 속도 측정용)}"
     "{max-frames|0     | 처리할 최대 프레임 수(0=전체)}";
 
@@ -854,7 +901,9 @@ int main(int argc, char** argv) {
     cfg.canny.low = args.get<double>("low");
     cfg.canny.high = args.get<double>("high");
     cfg.canny.adaptive = args.has("auto");
-    cfg.color.blueEdges = !args.has("no-blue");
+    cfg.feature.enabled = !args.has("no-feature");
+    cfg.feature.blue = !args.has("no-blue");
+    cfg.feature.yellow = !args.has("no-yellow");
 
     lane::VideoSource source;
     if (!source.open(args.get<string>("@video"), args.get<int>("width"))) {
@@ -992,6 +1041,15 @@ int main(int argc, char** argv) {
             if (key == 'd') {
                 debugView = !debugView;
                 fitWindow();
+            }
+            if (key == 's') {  // 현재 장면 저장: 원본 / 결과 / 디버그 (보고서 캡처, 문제 장면 공유용)
+                const string base = format("snap_%05d", n);
+                imwrite(base + "_raw.png", frame);
+                if (!view.empty()) {
+                    imwrite(base + "_result.png", view);
+                    imwrite(base + "_debug.png", makeDebugView(view, pre, lines));
+                }
+                printf("saved %s_raw/_result/_debug.png\n", base.c_str());
             }
         }
     }
